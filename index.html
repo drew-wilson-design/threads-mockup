@@ -272,8 +272,6 @@
     { handle: 'microsoftteams',     imgKey: 'microsoftteams',     name: 'Microsoft Teams',     color: '#6264A7', initials: 'MT',  likes: '7.3K',  comments: '944',  reposts: '718'  },
     { handle: 'microsoftazure',     imgKey: 'microsoftazure',     name: 'Microsoft Azure',     color: '#008AD7', initials: 'AZ',  likes: '5.8K',  comments: '760',  reposts: '533'  },
     { handle: 'microsoft365',       imgKey: 'microsoftdeveloper', name: 'Microsoft 365',        color: '#D83B01', initials: '365', likes: '9.1K',  comments: '1.3K', reposts: '812'  },
-    { handle: 'microsoftedu',      imgKey: 'microsoftsecurity',  name: 'Microsoft Education',  color: '#8661C5', initials: 'EDU', likes: '3.4K',  comments: '478',  reposts: '321'  },
-    { handle: 'microsoftcloud',    imgKey: 'microsoftsecurity',  name: 'Microsoft Cloud',      color: '#0078D4', initials: 'MC',  likes: '5.2K',  comments: '689',  reposts: '452'  },
   ];
 
   // ── State ─────────────────────────────────────────────────────────────────
@@ -354,34 +352,39 @@
     ctx.closePath();
   }
 
-  // Splits text into wrapped lines, breaking long words at character level
+  // Splits text into wrapped lines, breaking long words at character level.
+  // Preserves explicit newlines from the input as hard line breaks.
   function buildLines(text, maxW) {
-    const words = text.split(/\s+/).filter(Boolean);
     const lines = [];
-    let line = '';
 
-    const pushWord = (word) => {
-      // If word alone exceeds maxW, break it character by character
-      if (ctx.measureText(word).width > maxW) {
-        if (line) { lines.push(line); line = ''; }
-        let seg = '';
-        for (const ch of word) {
-          const t = seg + ch;
-          if (ctx.measureText(t).width > maxW && seg) {
-            lines.push(seg); seg = ch;
-          } else { seg = t; }
+    for (const paragraph of text.split('\n')) {
+      const words = paragraph.split(/[ \t]+/).filter(Boolean);
+      let line = '';
+
+      const pushWord = (word) => {
+        // If word alone exceeds maxW, break it character by character
+        if (ctx.measureText(word).width > maxW) {
+          if (line) { lines.push(line); line = ''; }
+          let seg = '';
+          for (const ch of word) {
+            const t = seg + ch;
+            if (ctx.measureText(t).width > maxW && seg) {
+              lines.push(seg); seg = ch;
+            } else { seg = t; }
+          }
+          line = seg;
+        } else {
+          const test = line ? line + ' ' + word : word;
+          if (ctx.measureText(test).width > maxW && line) {
+            lines.push(line); line = word;
+          } else { line = test; }
         }
-        line = seg;
-      } else {
-        const test = line ? line + ' ' + word : word;
-        if (ctx.measureText(test).width > maxW && line) {
-          lines.push(line); line = word;
-        } else { line = test; }
-      }
-    };
+      };
 
-    for (const word of words) pushWord(word);
-    if (line) lines.push(line);
+      for (const word of words) pushWord(word);
+      lines.push(line);
+    }
+
     return lines.length ? lines : [''];
   }
 
