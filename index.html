@@ -96,6 +96,26 @@
       display: flex;
       justify-content: flex-end;
     }
+    .copy-controls-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .btn-inline {
+      padding: 6px 10px;
+      border: 1.5px solid #e8e8e8;
+      border-radius: 8px;
+      background: #fafafa;
+      color: #555;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-inline:hover:not(:disabled) { background: #f0f0f0; color: #222; border-color: #ddd; }
+    .btn-inline:disabled { opacity: 0.45; cursor: default; }
     .char-count {
       font-size: 12px;
       color: #bbb;
@@ -162,12 +182,17 @@
     }
     .toggle-wrap input:checked ~ .toggle-thumb { transform: translateX(18px); }
 
-    .btn-download {
+    .download-stack {
       margin-top: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .btn-download {
       padding: 13px;
       background: #000;
       color: #fff;
-      border: none;
+      border: 1.5px solid #000;
       border-radius: 12px;
       font-family: inherit;
       font-size: 15px;
@@ -178,6 +203,12 @@
     }
     .btn-download:hover { background: #222; }
     .btn-download:active { transform: scale(0.98); }
+    .btn-download:disabled { opacity: 0.6; cursor: default; transform: none; }
+    .btn-download.btn-secondary {
+      background: #fff;
+      color: #000;
+    }
+    .btn-download.btn-secondary:hover { background: #f5f5f5; }
 
     /* ── Preview area ── */
     .preview-area {
@@ -208,6 +239,7 @@
       display: block;
     }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.js"></script>
 </head>
 <body>
 
@@ -226,8 +258,9 @@
 
   <div class="form-group">
     <div class="form-label">Post Copy</div>
-    <textarea id="copyInput" placeholder="What's new?" maxlength="500"></textarea>
-    <div class="char-row">
+    <textarea id="copyInput" placeholder="What's new? Wrap with ||double-bars|| to hide text behind a spoiler." maxlength="500"></textarea>
+    <div class="copy-controls-row">
+      <button class="btn-inline" id="makeSpoilerBtn" disabled>+ Spoiler from selection</button>
       <span class="char-count" id="charCount">0 / 500</span>
     </div>
   </div>
@@ -243,7 +276,10 @@
   </div>
 
 
-<button class="btn-download" id="downloadBtn">↓ Download PNG</button>
+<div class="download-stack">
+  <button class="btn-download btn-secondary" id="downloadPngBtn">↓ Download PNG</button>
+  <button class="btn-download" id="downloadBtn" hidden>↓ Download GIF</button>
+</div>
 </div>
 
 <div class="preview-area">
@@ -278,6 +314,7 @@
   let state = {
     handleIdx: 0,
     copy: '',
+    spoilerRevealed: false,
     theme: 'light',
     bg: 'subtle',
     verified: true,
@@ -342,6 +379,26 @@
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+  function strHash(s) {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+
+  function seededRand(seed) {
+    let s = seed >>> 0 || 1;
+    return () => {
+      s = (s + 0x6D2B79F5) >>> 0;
+      let t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
   function rrect(x, y, w, h, r) {
     ctx.beginPath();
     ctx.moveTo(x + r, y);
@@ -418,6 +475,177 @@
   function drawRepostIcon (cx, cy, s, color) { drawSvgIcon(SVG_REMIX,   cx, cy, s, color); }
   function drawSendIcon   (cx, cy, s, color) { drawSvgIcon(SVG_SEND,    cx, cy, s, color); }
 
+  // ── Inline spoiler tokenization + word-wrap ──────────────────────────────
+  // Spoilers are inline markdown-style: text wrapped in ||double bars||.
+  function tokenizeCopy(text) {
+    const tokens = [];
+    const re = /\|\|([\s\S]+?)\|\|/g;
+    let last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) tokens.push({ type: 'plain',   text: text.slice(last, m.index) });
+      tokens.push({                       type: 'spoiler', text: m[1] });
+      last = re.lastIndex;
+    }
+    if (last < text.length) tokens.push({ type: 'plain', text: text.slice(last) });
+    return tokens;
+  }
+
+  function hasSpoilerMarkers(text) {
+    return /\|\|[\s\S]+?\|\|/.test(text);
+  }
+
+  // Word-wrap a mix of plain/spoiler tokens into lines of typed segments.
+  // ctx.font must be set before calling.
+  function buildMixedCopyLines(text, maxW) {
+    const tokens = tokenizeCopy(text);
+    const lines = [];
+    let line = [];
+    let cursor = 0;
+    const spaceW = ctx.measureText(' ').width;
+
+    const flush = () => { lines.push(line); line = []; cursor = 0; };
+
+    const place = (word, type) => {
+      const w = ctx.measureText(word).width;
+      // Hard-break words that don't fit
+      if (w > maxW) {
+        if (cursor > 0) flush();
+        let seg = '';
+        for (const ch of word) {
+          const t = seg + ch;
+          if (ctx.measureText(t).width > maxW && seg) {
+            const segW = ctx.measureText(seg).width;
+            line.push({ type, text: seg, x: 0, w: segW });
+            flush();
+            seg = ch;
+          } else {
+            seg = t;
+          }
+        }
+        const segW = ctx.measureText(seg).width;
+        line.push({ type, text: seg, x: 0, w: segW });
+        cursor = segW;
+        return;
+      }
+      const sep = cursor > 0 ? spaceW : 0;
+      if (cursor + sep + w > maxW && line.length) flush();
+      const x = cursor === 0 ? 0 : cursor + spaceW;
+      line.push({ type, text: word, x, w });
+      cursor = x + w;
+    };
+
+    for (const tk of tokens) {
+      const segs = tk.text.split('\n');
+      for (let i = 0; i < segs.length; i++) {
+        if (i > 0) flush();          // explicit newline
+        const words = segs[i].split(/[ \t]+/);
+        for (const word of words) {
+          if (word) place(word, tk.type);
+        }
+      }
+    }
+    flush();
+    if (lines.length === 0) lines.push([]);
+    return lines;
+  }
+
+  // Merge adjacent same-type segments on a line into one run that spans the
+  // inter-word gaps (so a multi-word spoiler gets ONE continuous scribble).
+  function mergeMixedRuns(line) {
+    const out = [];
+    for (const seg of line) {
+      const prev = out[out.length - 1];
+      if (prev && prev.type === seg.type) {
+        prev.w = (seg.x + seg.w) - prev.x;
+        prev.text += ' ' + seg.text;
+      } else {
+        out.push({ type: seg.type, text: seg.text, x: seg.x, w: seg.w });
+      }
+    }
+    return out;
+  }
+
+  // ── Spoiler scribble animation ───────────────────────────────────────────
+  let _spoilerCtx = null;
+  let _spoilerRaf = null;
+  let _gifRendering = false;   // when true, draw() won't start the live rAF
+
+  // Generate the dot field across ALL spoiler regions in the current layout.
+  function buildInlineSpoilerDots(regions) {
+    const dots = [];
+    const rand = seededRand(strHash(state.copy));
+    for (const region of regions) {
+      const cy = region.y + 11;         // approx vertical center of the text line
+      const band = 10;
+      const attempts = Math.floor(region.w * 3.0);
+      for (let k = 0; k < attempts; k++) {
+        const t = rand();
+        const envelope = 0.7 + 0.3 * Math.sin(t * Math.PI);
+        if (rand() > envelope) continue;
+        const outlier = rand() < 0.1;
+        const big = rand() < 0.06;
+        dots.push({
+          x: region.x + t * region.w,
+          y: cy + (rand() - 0.5) * band * (outlier ? 1.7 : 1),
+          r: big ? 0.9 + rand() * 0.7 : 0.25 + rand() * 0.75,
+          baseAlpha: 0.30 + rand() * 0.30,
+          twAmp:     0.55 + rand() * 0.45,
+          twFreq:    0.0020 + rand() * 0.0060,
+          twPhase:   rand() * Math.PI * 2,
+          drFreq:    0.0010 + rand() * 0.0026,
+          drPhase:   rand() * Math.PI * 2,
+          drAmpX:    1.4 + rand() * 1.6,
+          drAmpY:    1.0 + rand() * 1.2,
+        });
+      }
+    }
+    return dots;
+  }
+
+  function paintSpoilerFrame(now) {
+    const c = _spoilerCtx;
+    if (!c || !c.regions || !c.regions.length || !c.dots) return;
+    ctx.save();
+    rrect(30, 30, W - 60, c.cardH, 18);
+    ctx.clip();
+    // Erase only each spoiler run back to card background — leaves adjacent
+    // plain text on the same line untouched.
+    ctx.fillStyle = c.cardBg;
+    for (const r of c.regions) {
+      ctx.fillRect(r.x - 3, r.y - 3, r.w + 6, 29);
+    }
+    ctx.fillStyle = c.scribbleColor;
+    const dots = c.dots;
+    for (let i = 0; i < dots.length; i++) {
+      const d = dots[i];
+      const tw = Math.sin(now * d.twFreq + d.twPhase);
+      let a = d.baseAlpha + tw * d.twAmp;
+      if (a < 0) a = 0; else if (a > 1) a = 1;
+      const dr = now * d.drFreq + d.drPhase;
+      const dx = Math.sin(dr) * d.drAmpX;
+      const dy = Math.cos(dr * 1.13) * d.drAmpY;
+      ctx.globalAlpha = a;
+      ctx.beginPath();
+      ctx.arc(d.x + dx, d.y + dy, d.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function spoilerTick(now) {
+    if (!_spoilerCtx || state.spoilerRevealed) {
+      _spoilerRaf = null;
+      return;
+    }
+    paintSpoilerFrame(now);
+    _spoilerRaf = requestAnimationFrame(spoilerTick);
+  }
+
+  function stopSpoilerAnimation() {
+    if (_spoilerRaf) { cancelAnimationFrame(_spoilerRaf); _spoilerRaf = null; }
+  }
+
   // ── Main draw ─────────────────────────────────────────────────────────────
   function draw() {
     const p  = palette();
@@ -431,7 +659,8 @@
     const LINE_H  = 23;
     const _copyY  = _avY + _avR + 18;
     ctx.font = '15px -apple-system,BlinkMacSystemFont,sans-serif';
-    const nLines  = countLines(copy, _textMaxW);
+    const _copyLines = buildMixedCopyLines(copy, _textMaxW);
+    const nLines  = Math.max(1, _copyLines.length);
     const _copyBottom = _copyY + nLines * LINE_H;
     const _actY   = _copyBottom + 46;
     const CARD_BOT_PAD = 5;   // space below icons to card edge
@@ -571,19 +800,54 @@
     }
     ctx.restore();
 
-    // ── copy text ───────────────────────────────────────────────
+    // ── copy text (plain + inline spoilers) ─────────────────────
     const copyY = avY + avR + 18;
     const textMaxW = W - 60 - textX - 20;
+    const spoilerRegions = [];
     ctx.save();
-    // clip to card interior so text never bleeds outside
     rrect(30, 30, W - 60, H - 30 - SHADOW_BLEED, 18);
     ctx.clip();
     ctx.font = '15px -apple-system,BlinkMacSystemFont,sans-serif';
     ctx.fillStyle = p.text;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    wrapText(copy, textX, copyY, textMaxW, 23);
+
+    _copyLines.forEach((line, i) => {
+      const y = copyY + i * LINE_H;
+      const merged = mergeMixedRuns(line);
+      for (const run of merged) {
+        if (run.type === 'spoiler') {
+          spoilerRegions.push({ x: textX + run.x, y, w: run.w, text: run.text });
+          if (state.spoilerRevealed) {
+            ctx.fillText(run.text, textX + run.x, y);
+          }
+        } else {
+          ctx.fillText(run.text, textX + run.x, y);
+        }
+      }
+    });
     ctx.restore();
+
+    // ── set up animated scribble for the spoiler runs ───────────
+    if (spoilerRegions.length) {
+      _spoilerCtx = {
+        regions: spoilerRegions,
+        cardH: H - 30 - SHADOW_BLEED,
+        cardBg: p.cardBg,
+        textColor: p.text,
+        scribbleColor: state.theme === 'dark' ? '#d8d8d8' : '#1f1f1f',
+      };
+      _spoilerCtx.dots = buildInlineSpoilerDots(spoilerRegions);
+      if (state.spoilerRevealed || _gifRendering) {
+        stopSpoilerAnimation();
+      } else {
+        if (_spoilerRaf) cancelAnimationFrame(_spoilerRaf);
+        _spoilerRaf = requestAnimationFrame(spoilerTick);
+      }
+    } else {
+      _spoilerCtx = null;
+      stopSpoilerAnimation();
+    }
 
     // ── action bar ──────────────────────────────────────────────
     const actY  = _actY;
@@ -619,15 +883,64 @@
     draw();
   });
 
-  const copyInput = document.getElementById('copyInput');
-  const charCount = document.getElementById('charCount');
-  copyInput.addEventListener('input', () => {
-    const len = copyInput.value.length;
-    state.copy = copyInput.value;
+  const copyInput      = document.getElementById('copyInput');
+  const charCount      = document.getElementById('charCount');
+  const makeSpoilerBtn = document.getElementById('makeSpoilerBtn');
+
+  function syncCopyState() {
+    const v = copyInput.value;
+    const len = v.length;
+    state.copy = v;
     charCount.textContent = `${len} / 500`;
     charCount.className = 'char-count' + (len > 400 ? (len > 480 ? ' over' : ' warn') : '');
+    document.getElementById('downloadBtn').hidden = !hasSpoilerMarkers(v);
+  }
+
+  function updateMakeSpoilerBtn() {
+    makeSpoilerBtn.disabled = copyInput.selectionStart === copyInput.selectionEnd;
+  }
+
+  copyInput.addEventListener('input', () => {
+    state.spoilerRevealed = false;
+    syncCopyState();
+    updateMakeSpoilerBtn();
     draw();
   });
+  copyInput.addEventListener('select',  updateMakeSpoilerBtn);
+  copyInput.addEventListener('keyup',   updateMakeSpoilerBtn);
+  copyInput.addEventListener('click',   updateMakeSpoilerBtn);
+  copyInput.addEventListener('blur',    () => { /* keep current state */ });
+
+  // Wrap the current selection with ||...|| spoiler markers.
+  makeSpoilerBtn.addEventListener('click', () => {
+    const start = copyInput.selectionStart;
+    const end   = copyInput.selectionEnd;
+    if (start === end) return;
+    const v = copyInput.value;
+    copyInput.value = v.slice(0, start) + '||' + v.slice(start, end) + '||' + v.slice(end);
+    copyInput.focus();
+    copyInput.setSelectionRange(start + 2, end + 2);
+    copyInput.dispatchEvent(new Event('input'));
+  });
+
+  // Click any spoiler scribble region to toggle reveal of ALL spoilers.
+  function spoilerHitTest(e) {
+    if (!_spoilerCtx || !_spoilerCtx.regions) return false;
+    for (const r of _spoilerCtx.regions) {
+      if (e.offsetX >= r.x - 3 && e.offsetX <= r.x + r.w + 3 &&
+          e.offsetY >= r.y - 3 && e.offsetY <= r.y + 26) return true;
+    }
+    return false;
+  }
+  canvas.addEventListener('click', (e) => {
+    if (!_spoilerCtx || !spoilerHitTest(e)) return;
+    state.spoilerRevealed = !state.spoilerRevealed;
+    draw();
+  });
+  canvas.addEventListener('mousemove', (e) => {
+    canvas.style.cursor = _spoilerCtx && spoilerHitTest(e) ? 'pointer' : '';
+  });
+  canvas.addEventListener('mouseleave', () => { canvas.style.cursor = ''; });
 
   document.querySelectorAll('[data-theme]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -639,19 +952,163 @@
   });
 
 
-  document.getElementById('downloadBtn').addEventListener('click', () => {
+  const downloadBtn    = document.getElementById('downloadBtn');
+  const downloadPngBtn = document.getElementById('downloadPngBtn');
+
+  function downloadPng() {
     const h = HANDLES[state.handleIdx];
     canvas.toBlob(blob => {
       const url = URL.createObjectURL(blob);
       const a   = document.createElement('a');
       a.href     = url;
       a.download = `threads-@${h.handle}.png`;
+      a.style.display = 'none';
+      document.body.appendChild(a);
       a.click();
+      document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     }, 'image/png');
+  }
+
+  downloadPngBtn.addEventListener('click', downloadPng);
+
+  // gif.js worker — fetched as a blob to bypass cross-origin worker restrictions.
+  let _gifWorkerUrl = null;
+  async function getGifWorkerUrl() {
+    if (_gifWorkerUrl) return _gifWorkerUrl;
+    const resp = await fetch('https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.worker.js');
+    if (!resp.ok) throw new Error('Failed to load GIF worker');
+    const blob = await resp.blob();
+    _gifWorkerUrl = URL.createObjectURL(blob);
+    return _gifWorkerUrl;
+  }
+
+  async function renderAnimatedGif() {
+    downloadBtn.dataset.busy = '1';
+    downloadBtn.disabled = true;
+    downloadBtn.textContent = 'Loading…';
+    _gifRendering = true;
+    stopSpoilerAnimation();
+
+    try {
+      if (typeof GIF !== 'function') {
+        throw new Error('GIF encoder not loaded — check your network connection (gif.js CDN).');
+      }
+      const workerScript = await getGifWorkerUrl();
+
+      const wasRevealed = state.spoilerRevealed;
+
+      // Snapshot 1: hidden — used as the base for every animated frame.
+      state.spoilerRevealed = false;
+      draw();
+      const hiddenImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // Snapshot 2: revealed — used for the final held frame.
+      state.spoilerRevealed = true;
+      draw();
+      const revealedImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // Back to hidden so _spoilerCtx + dots match the hiddenImage state.
+      state.spoilerRevealed = false;
+      draw();
+
+      const Hlogical = canvas.height / SCALE;
+
+      // Render the GIF at logical (CSS-pixel) resolution to keep file size sane.
+      const tmp  = document.createElement('canvas');
+      tmp.width  = W;
+      tmp.height = Hlogical;
+      const tctx = tmp.getContext('2d');
+      const snapToTmp = () => {
+        tctx.clearRect(0, 0, W, Hlogical);
+        tctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, W, Hlogical);
+      };
+
+      const FPS         = 15;
+      const ANIM_MS     = 10000;
+      const frameDelay  = Math.round(1000 / FPS);
+      const totalFrames = Math.floor(ANIM_MS / frameDelay);
+      const HOLD_MS     = 2500;
+
+      const gif = new GIF({
+        workers: 2,
+        quality: 10,
+        width:   W,
+        height:  Hlogical,
+        workerScript,
+      });
+
+      // 10s of animated shimmer
+      for (let f = 0; f < totalFrames; f++) {
+        ctx.putImageData(hiddenImage, 0, 0);
+        paintSpoilerFrame(f * frameDelay);
+        snapToTmp();
+        gif.addFrame(tmp, { copy: true, delay: frameDelay });
+
+        if ((f & 7) === 0) {
+          const pct = Math.round((f / totalFrames) * 60);
+          downloadBtn.textContent = `Capturing ${pct}%`;
+          await new Promise(r => setTimeout(r));
+        }
+      }
+
+      // Final held frame with the spoiler revealed
+      ctx.putImageData(revealedImage, 0, 0);
+      snapToTmp();
+      gif.addFrame(tmp, { copy: true, delay: HOLD_MS });
+
+      downloadBtn.textContent = 'Encoding 60%';
+
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const done = (fn) => (...args) => { if (settled) return; settled = true; fn(...args); };
+        gif.on('progress', (p) => {
+          downloadBtn.textContent = `Encoding ${Math.round(60 + p * 40)}%`;
+        });
+        gif.on('finished', done((blob) => {
+          const h = HANDLES[state.handleIdx];
+          const url = URL.createObjectURL(blob);
+          const a   = document.createElement('a');
+          a.href      = url;
+          a.download  = `threads-@${h.handle}.gif`;
+          a.rel       = 'noopener';
+          a.style.display = 'none';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 2000);
+          resolve();
+        }));
+        gif.on('abort', done(() => reject(new Error('GIF render aborted'))));
+        try {
+          gif.render();
+        } catch (e) {
+          done(reject)(e);
+        }
+      });
+
+      // Restore prior reveal state and resume the live shimmer.
+      state.spoilerRevealed = wasRevealed;
+    } catch (err) {
+      console.error(err);
+      alert('GIF render failed: ' + (err && err.message ? err.message : err));
+    } finally {
+      _gifRendering = false;
+      downloadBtn.dataset.busy = '';
+      downloadBtn.disabled = false;
+      downloadBtn.textContent = '↓ Download GIF';
+      draw();
+    }
+  }
+
+  downloadBtn.addEventListener('click', () => {
+    if (!_spoilerCtx || !_spoilerCtx.regions || !_spoilerCtx.regions.length) return;
+    renderAnimatedGif();
   });
 
   // ── Init ─────────────────────────────────────────────────────────────────
+  syncCopyState();
+  updateMakeSpoilerBtn();
   draw();
 </script>
 </body>
