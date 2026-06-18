@@ -569,6 +569,7 @@
   let _spoilerCtx = null;
   let _spoilerRaf = null;
   let _gifRendering = false;   // when true, draw() won't start the live rAF
+  let _exportNoShadow = false; // when true, draw() skips the card shadow (for GIF export)
 
   // Generate the dot field across ALL spoiler regions in the current layout.
   function buildInlineSpoilerDots(regions) {
@@ -676,15 +677,17 @@
     // transparent background
     ctx.clearRect(0, 0, W, H);
 
-    // card shadow
-    ctx.save();
-    ctx.shadowColor   = p.shadow;
-    ctx.shadowBlur    = 32;
-    ctx.shadowOffsetY = 8;
-    rrect(30, 30, W - 60, H - 30 - SHADOW_BLEED, 18);
-    ctx.fillStyle = p.cardBg;
-    ctx.fill();
-    ctx.restore();
+    // card shadow (skipped during GIF export so the transparent bg stays clean)
+    if (!_exportNoShadow) {
+      ctx.save();
+      ctx.shadowColor   = p.shadow;
+      ctx.shadowBlur    = 32;
+      ctx.shadowOffsetY = 8;
+      rrect(30, 30, W - 60, H - 30 - SHADOW_BLEED, 18);
+      ctx.fillStyle = p.cardBg;
+      ctx.fill();
+      ctx.restore();
+    }
 
     // card bg (no shadow)
     rrect(30, 30, W - 60, H - 30 - SHADOW_BLEED, 18);
@@ -988,6 +991,7 @@
     downloadBtn.disabled = true;
     downloadBtn.textContent = 'Loading…';
     _gifRendering = true;
+    _exportNoShadow = true;
     stopSpoilerAnimation();
 
     try {
@@ -1015,6 +1019,10 @@
       const Hlogical = canvas.height / SCALE;
 
       // Render the GIF at logical (CSS-pixel) resolution to keep file size sane.
+      // GIFs only support a single transparent palette index — we use pure
+      // magenta as that sentinel and threshold the source alpha against it so
+      // anti-aliased card edges become hard-edge instead of a magenta fringe.
+      const TRANSPARENT = 0xFF00FF; // 255, 0, 255
       const tmp  = document.createElement('canvas');
       tmp.width  = W;
       tmp.height = Hlogical;
@@ -1022,6 +1030,19 @@
       const snapToTmp = () => {
         tctx.clearRect(0, 0, W, Hlogical);
         tctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, W, Hlogical);
+        const img = tctx.getImageData(0, 0, W, Hlogical);
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i + 3] < 128) {
+            d[i]     = 0xFF;
+            d[i + 1] = 0x00;
+            d[i + 2] = 0xFF;
+            d[i + 3] = 0xFF;
+          } else {
+            d[i + 3] = 0xFF;
+          }
+        }
+        tctx.putImageData(img, 0, 0);
       };
 
       const FPS         = 15;
@@ -1036,6 +1057,8 @@
         width:   W,
         height:  Hlogical,
         workerScript,
+        transparent: TRANSPARENT,
+        background:  '#ff00ff',
       });
 
       // 10s of animated shimmer
@@ -1094,6 +1117,7 @@
       alert('GIF render failed: ' + (err && err.message ? err.message : err));
     } finally {
       _gifRendering = false;
+      _exportNoShadow = false;
       downloadBtn.dataset.busy = '';
       downloadBtn.disabled = false;
       downloadBtn.textContent = '↓ Download GIF';
